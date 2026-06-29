@@ -544,6 +544,50 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
     return False
 
 # ---------- 登录 ----------
+ZAMPTO_COOKIES = os.environ.get("ZAMPTO_COOKIES", "")
+
+# ---------- Cookie 登录（优先方式，跳过表单+验证码） ----------
+def try_cookie_login(page) -> bool:
+    if not ZAMPTO_COOKIES:
+        log.info("未配置 ZAMPTO_COOKIES，跳过 cookie 登录")
+        return False
+
+    try:
+        data = json.loads(ZAMPTO_COOKIES)
+    except Exception as e:
+        log.warning(f"ZAMPTO_COOKIES 不是合法 JSON: {e}")
+        return False
+
+    # 支持两种格式：Playwright storage_state 完整结构 {"cookies":[...]} 或纯 cookie 数组 [...]
+    cookies = data.get("cookies", data) if isinstance(data, dict) else data
+    if not cookies:
+        log.warning("ZAMPTO_COOKIES 中没有 cookies 字段")
+        return False
+
+    try:
+        page.context.add_cookies(cookies)
+        log.info(f"✅ 已注入 {len(cookies)} 条 cookie")
+    except Exception as e:
+        log.warning(f"注入 cookie 失败: {e}")
+        return False
+
+    try:
+        page.goto(f"{BASE_URL}/", timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"cookie 登录后访问首页失败: {e}")
+        return False
+
+    time.sleep(3)
+
+    if "/auth/login" not in page.url:
+        log.info("✅ Cookie 登录成功，已处于已登录状态")
+        take_screenshot(page, "00_cookie_login_success")
+        return True
+
+    log.warning("⚠️ Cookie 已失效（被重定向回登录页），fallback 到表单登录")
+    return False
+
+
 def login(page, max_retries=3) -> bool:
     # 新版登录页：dash.zampto.net/auth/login，邮箱+密码同页提交
     login_url = "https://dash.zampto.net/auth/login"
@@ -975,9 +1019,10 @@ def main():
     page = browser.new_page()
 
     try:
-        if not login(page):
-            wxpush("❌ Zampto 登录失败，请检查账号密码")
-            return
+        if not try_cookie_login(page):
+            if not login(page):
+                wxpush("❌ Zampto 登录失败（cookie 已失效，且账号密码登录也失败，请检查）")
+                return
 
         dismiss_all_popups(page)
 
