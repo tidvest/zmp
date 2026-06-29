@@ -15,7 +15,7 @@ WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
 SKIP_RENEW     = os.environ.get("SKIP_RENEW", "false").lower() == "true"
 
 BASE_URL    = "https://dash.zampto.net"
-AUTH_URL    = "https://auth.zampto.net/sign-in"
+AUTH_URL    = "https://dash.zampto.net/auth/login"
 SERVERS_URL = f"{BASE_URL}/servers"
 
 SCREENSHOT_DIR = Path("./screenshots")
@@ -545,7 +545,8 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
 
 # ---------- 登录 ----------
 def login(page, max_retries=3) -> bool:
-    login_url = "https://auth.zampto.net/sign-in?app_id=YOUR_APP_ID"
+    # 新版登录页：dash.zampto.net/auth/login，邮箱+密码同页提交
+    login_url = "https://dash.zampto.net/auth/login"
 
     for attempt in range(1, max_retries + 1):
         log.info(f"登录 {attempt}/{max_retries}")
@@ -554,49 +555,34 @@ def login(page, max_retries=3) -> bool:
         except Exception as e:
             log.warning(f"goto 异常: {e}")
 
+        # 等待邮箱输入框出现
         try:
             page.wait_for_selector(
-                'input[name="identifier"], input[autocomplete="username email"]',
+                'input#email, input[type="email"], input[placeholder*="example"]',
                 timeout=15000
             )
         except:
-            log.warning("找不到用户名输入框，重试")
+            log.warning("找不到邮箱输入框，重试")
             take_screenshot(page, f"login_no_input_{attempt}")
             time.sleep(2)
             continue
 
+        # 填写邮箱
         try:
-            user_el = page.locator('input[name="identifier"]').first
-            user_el.click()
-            user_el.fill("")
-            user_el.type(USERNAME, delay=random.randint(60, 130))
-            log.info("已填写用户名")
+            email_el = page.locator('input#email, input[type="email"]').first
+            email_el.click()
+            email_el.fill("")
+            email_el.type(USERNAME, delay=random.randint(60, 130))
+            log.info("已填写邮箱")
         except Exception as e:
-            log.warning(f"填写用户名失败: {e}")
+            log.warning(f"填写邮箱失败: {e}")
             continue
 
-        human_delay()
+        human_delay(0.3, 0.8)
 
+        # 填写密码
         try:
-            page.locator('button[name="submit"], button[type="submit"]').first.click()
-            log.info("已点击登录按钮（第一步）")
-        except Exception as e:
-            log.warning(f"点击登录失败: {e}")
-            continue
-
-        try:
-            page.wait_for_selector(
-                'input[name="password"], input[autocomplete="current-password"]',
-                timeout=15000
-            )
-            log.info("已进入密码输入页")
-        except:
-            log.warning("未出现密码输入框，重试")
-            take_screenshot(page, f"login_no_password_{attempt}")
-            continue
-
-        try:
-            pass_el = page.locator('input[name="password"]').first
+            pass_el = page.locator('input#password, input[type="password"]').first
             pass_el.click()
             pass_el.fill("")
             pass_el.type(PASSWORD, delay=random.randint(60, 130))
@@ -607,20 +593,28 @@ def login(page, max_retries=3) -> bool:
 
         human_delay()
 
+        # 点击 Login 按钮
         try:
-            page.locator('button[name="submit"], button[type="submit"]').first.click()
-            log.info("已点击继续按钮（第二步）")
+            page.locator('button[type="submit"]:has-text("Login"), button:has-text("Login")').first.click()
+            log.info("已点击 Login 按钮")
         except Exception as e:
-            log.warning(f"点击继续失败: {e}")
+            log.warning(f"点击 Login 按钮失败: {e}")
             continue
 
         if wait_for_url_contains(page, "dash.zampto.net", 20):
-            log.info("✅ 登录成功，已跳转到 dashboard")
-            take_screenshot(page, "01_login_success")
-            return True
+            # 登录后落地页是 /auth/login 表示失败，其他路径才算成功
+            if "/auth/login" not in page.url:
+                log.info("✅ 登录成功，已跳转到 dashboard")
+                take_screenshot(page, "01_login_success")
+                return True
+            else:
+                log.warning("页面仍在登录页，可能账号密码有误")
+                take_screenshot(page, f"login_fail_{attempt}")
+                time.sleep(2)
+                continue
 
         time.sleep(3)
-        if "dash.zampto.net" in page.url or "zampto.net/server" in page.url:
+        if "dash.zampto.net" in page.url and "/auth/login" not in page.url:
             log.info("✅ 登录成功")
             take_screenshot(page, "01_login_success")
             return True
