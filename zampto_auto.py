@@ -564,6 +564,16 @@ def try_cookie_login(page) -> bool:
         log.warning("ZAMPTO_COOKIES 中没有 cookies 字段")
         return False
 
+    # 过滤 Playwright add_cookies 不支持的字段（如 Chrome DevTools 导出的 partitionKey 等）
+    ALLOWED_KEYS = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite", "url"}
+    cleaned_cookies = []
+    for c in cookies:
+        cc = {k: v for k, v in c.items() if k in ALLOWED_KEYS}
+        if cc.get("sameSite") not in ("Strict", "Lax", "None", None):
+            cc.pop("sameSite", None)
+        cleaned_cookies.append(cc)
+    cookies = cleaned_cookies
+
     try:
         page.context.add_cookies(cookies)
         log.info(f"✅ 已注入 {len(cookies)} 条 cookie")
