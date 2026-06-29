@@ -929,19 +929,48 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(1)
 
-        clicked = page.evaluate("""() => {
-            var els = Array.from(document.querySelectorAll('a, button'));
-            for (var el of els) {
-                var txt = (el.innerText || el.textContent || '').trim();
-                if (txt === 'Renew Server' || txt.includes('Renew Server')) {
-                    el.scrollIntoView({block: 'center'});
-                    if (el.onclick) { el.onclick(new MouseEvent('click')); return 'onclick'; }
-                    el.click();
-                    return 'click';
+        clicked = None
+        # 优先用 Playwright 原生点击（真实可信事件，React onClick 才能正常响应）
+        try:
+            renew_btn = page.locator('button:has-text("Renew Server"), a:has-text("Renew Server")').first
+            renew_btn.scroll_into_view_if_needed()
+            time.sleep(0.5)
+            renew_btn.click(timeout=8000)
+            clicked = "locator_click"
+            log.info("已点击 Renew Server 按钮（Playwright 原生点击）")
+        except Exception as e:
+            log.warning(f"Playwright 原生点击失败: {e}，尝试 force click...")
+            try:
+                renew_btn = page.locator('button:has-text("Renew Server"), a:has-text("Renew Server")').first
+                renew_btn.click(force=True, timeout=8000)
+                clicked = "locator_force_click"
+                log.info("已点击 Renew Server 按钮（force click）")
+            except Exception as e2:
+                log.warning(f"force click 也失败: {e2}，fallback 到 JS dispatchEvent...")
+
+        # JS 兜底：用 dispatchEvent 而非直接调用 onclick，更接近真实事件
+        if not clicked:
+            clicked = page.evaluate("""() => {
+                var els = Array.from(document.querySelectorAll('a, button'));
+                for (var el of els) {
+                    var txt = (el.innerText || el.textContent || '').trim();
+                    if (txt === 'Renew Server' || txt.includes('Renew Server')) {
+                        el.scrollIntoView({block: 'center'});
+                        var rect = el.getBoundingClientRect();
+                        var opts = {bubbles: true, cancelable: true, view: window,
+                                    clientX: rect.x + rect.width/2, clientY: rect.y + rect.height/2};
+                        el.dispatchEvent(new MouseEvent('pointerdown', opts));
+                        el.dispatchEvent(new MouseEvent('mousedown', opts));
+                        el.dispatchEvent(new MouseEvent('pointerup', opts));
+                        el.dispatchEvent(new MouseEvent('mouseup', opts));
+                        el.dispatchEvent(new MouseEvent('click', opts));
+                        return 'dispatchEvent';
+                    }
                 }
-            }
-            return null;
-        }""")
+                return null;
+            }""")
+            if clicked:
+                log.info(f"已点击 Renew Server 按钮（JS {clicked}）")
 
         if not clicked:
             log.warning("JS 未找到 Renew Server 按钮，尝试 Playwright locator...")
