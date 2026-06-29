@@ -444,14 +444,22 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
     log.info("等待 Cloudflare Turnstile 验证...")
     _reset_cf_frame_seen()
 
-    renew_modal_visible = page.evaluate("""() => {
-        var m = document.getElementById('renewModal');
-        if (!m) return false;
-        var cs = window.getComputedStyle(m);
-        return cs.display !== 'none' && cs.visibility !== 'hidden';
-    }""")
+    # 单次 evaluate 容易撞上页面局部重渲染（倒计时/状态刷新）的瞬时空档，
+    # 导致弹窗明明存在却查不到 → 改为短轮询，最多查 6 次（约 3s）
+    renew_modal_visible = False
+    for _retry in range(6):
+        renew_modal_visible = page.evaluate("""() => {
+            var m = document.getElementById('renewModal');
+            if (!m) return false;
+            var cs = window.getComputedStyle(m);
+            return cs.display !== 'none' && cs.visibility !== 'hidden';
+        }""")
+        if renew_modal_visible:
+            break
+        time.sleep(0.5)
+
     if not renew_modal_visible:
-        log.warning("⚠️ 续期弹窗未检测到（可能被广告弹窗遮挡或未弹出）")
+        log.warning("⚠️ 续期弹窗未检测到（可能被广告弹窗遮挡或未弹出，已重试6次）")
         return False
 
     start = time.time()
@@ -909,6 +917,45 @@ def start_server(page) -> bool:
     return True
 
 # ---------- 续期 ----------
+def _recheck_expiry_increased(page, server_id: str, expiry_before: str) -> bool:
+    """重新刷新页面读取 expiry，跟续期前对比，判断续期是否（在后台静默）实际成功了"""
+    try:
+        page.reload(timeout=20000, wait_until="domcontentloaded")
+        time.sleep(3)
+        dismiss_all_popups(page)
+        time.sleep(1)
+    except Exception as e:
+        log.warning(f"复核 expiry 时刷新页面失败: {e}，改用 goto 重新导航...")
+        try:
+            page.goto(f"{BASE_URL}/server?id={server_id}", timeout=30000, wait_until="domcontentloaded")
+            time.sleep(3)
+            dismiss_all_popups(page)
+            time.sleep(1)
+        except Exception as e2:
+            log.warning(f"复核 expiry 时重新导航也失败: {e2}")
+            return False
+
+    info_after = page.evaluate("""() => {
+        var body = document.body.innerText || '';
+        var m = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
+        return m ? m[1].trim() : null;
+    }""")
+    log.info(f"复核 expiry（页面直读）: {info_after}")
+
+    minutes_before = parse_expiry_minutes(expiry_before)
+    minutes_after  = parse_expiry_minutes(info_after)
+
+    log.info(f"续期前 expiry 分钟数: {minutes_before}, 复核后: {minutes_after}")
+
+    if minutes_after > 0 and (minutes_after > minutes_before or minutes_before <= 0):
+        log.info(f"✅ 复核确认续期已成功！expiry: {expiry_before} → {info_after}"
+                 f"（增加了 {minutes_after - minutes_before} 分钟）")
+        return True
+
+    log.info(f"复核结果：expiry 未增加（{expiry_before} → {info_after}），确认未续期成功")
+    return False
+
+
 def renew_server(page, server_id: str, expiry_before: str) -> bool:
     server_url = f"{BASE_URL}/server?id={server_id}"
     log.info(f"准备续期，访问服务器详情页")
@@ -995,47 +1042,18 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
     take_screenshot(page, "06_renew_modal")
 
     if not wait_cf_turnstile(page, timeout=90):
-        log.warning("CF 验证超时或续期弹窗未出现，续期失败")
+        log.warning("CF 验证超时或续期弹窗未出现，正在复核 expiry 确认是否已静默续期成功...")
         take_screenshot(page, "06_cf_timeout")
+        if _recheck_expiry_increased(page, server_id, expiry_before):
+            log.info("✅ 检测逻辑误判，但 expiry 复核确认续期实际已成功")
+            return True
+        log.warning("复核确认续期确实失败")
         return False
 
     time.sleep(8)
     take_screenshot(page, "07_after_renew")
 
-    try:
-        page.reload(timeout=20000, wait_until="domcontentloaded")
-        time.sleep(3)
-        dismiss_all_popups(page)
-        time.sleep(1)
-    except Exception as e:
-        log.warning(f"续期后刷新页面失败: {e}，改用 goto 重新导航...")
-        try:
-            page.goto(f"{BASE_URL}/server?id={server_id}", timeout=30000, wait_until="domcontentloaded")
-            time.sleep(3)
-            dismiss_all_popups(page)
-            time.sleep(1)
-        except Exception as e2:
-            log.warning(f"续期后重新导航也失败: {e2}")
-
-    info_after = page.evaluate("""() => {
-        var body = document.body.innerText || '';
-        var m = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
-        return m ? m[1].trim() : null;
-    }""")
-    log.info(f"续期后 expiry（页面直读）: {info_after}")
-
-    minutes_before = parse_expiry_minutes(expiry_before)
-    minutes_after  = parse_expiry_minutes(info_after)
-
-    log.info(f"续期前 expiry 分钟数: {minutes_before}, 续期后: {minutes_after}")
-
-    if minutes_after > 0 and (minutes_after > minutes_before or minutes_before <= 0):
-        log.info(f"✅ 续期成功！expiry: {expiry_before} → {info_after}（增加了 {minutes_after - minutes_before} 分钟）")
-        return True
-
-    log.warning(f"⚠️ 续期后 expiry 未增加（{expiry_before} → {info_after}），续期失败！"
-                f"（前={minutes_before}min，后={minutes_after}min）")
-    return False
+    return _recheck_expiry_increased(page, server_id, expiry_before)
 
 # ---------- 主流程 ----------
 def main():
