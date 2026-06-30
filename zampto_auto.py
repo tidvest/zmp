@@ -1041,17 +1041,46 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
 
     take_screenshot(page, "06_renew_modal")
 
-    if not wait_cf_turnstile(page, timeout=90):
-        log.warning("CF 验证超时或续期弹窗未出现，正在复核 expiry 确认是否已静默续期成功...")
-        take_screenshot(page, "06_cf_timeout")
-        if _recheck_expiry_increased(page, server_id, expiry_before):
-            log.info("✅ 检测逻辑误判，但 expiry 复核确认续期实际已成功")
-            return True
-        log.warning("复核确认续期确实失败")
-        return False
+    # ── Zampto 使用无感 Turnstile：弹窗出现 → 静默验证（<3s）→ 续期成功 → 页面自动重载
+    # 不检测 Turnstile widget，直接监听"页面重载"信号（context destroyed = 导航发生）
+    log.info("等待续期弹窗自动完成（监听页面重载信号，最多 40s）...")
+    nav_detected = False
+    modal_gone   = False
+    for _tick in range(40):
+        try:
+            ready = page.evaluate("() => document.readyState")
+            # 页面还在，检查弹窗是否已消失（续期成功后弹窗关闭）
+            modal_open = page.evaluate("""() => {
+                // shadcn Dialog: role=dialog + data-state=open
+                var d = document.querySelector('[role=\"dialog\"][data-state=\"open\"]');
+                if (d) return true;
+                // 兜底：页面文本含 Renew Server 弹窗关键词
+                var body = document.body.innerText || '';
+                return body.includes('Loading security verification') ||
+                       body.includes('Processing renewal request') ||
+                       body.includes('complete the security verification');
+            }""")
+            if not modal_open:
+                modal_gone = True
+                log.info(f"✅ 续期弹窗已消失（第 {_tick+1}s），续期流程完成")
+                break
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ("context", "destroyed", "navigation", "detached")):
+                nav_detected = True
+                log.info(f"✅ 检测到页面自动重载（Turnstile 静默通过后自动续期完成）: {e}")
+            else:
+                log.warning(f"evaluate 异常: {e}")
+            break
+        time.sleep(1)
+    else:
+        log.warning("⚠️ 40s 内未检测到弹窗消失或页面重载，进行 expiry 复核...")
 
-    time.sleep(8)
     take_screenshot(page, "07_after_renew")
+
+    if nav_detected or modal_gone:
+        # 页面导航后先等它加载完
+        time.sleep(3)
 
     return _recheck_expiry_increased(page, server_id, expiry_before)
 
