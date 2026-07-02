@@ -705,6 +705,9 @@ def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
         return None
 
     log.info(f"连接 IMAP {IMAP_HOST}，等待 Zampto 验证码邮件（最多 {wait_seconds}s）...")
+    # 等待 10 秒让 Zampto 把新邮件发出来，避免过早轮询读到上一封旧验证码
+    log.info("等待 10s 让验证码邮件到达...")
+    time.sleep(10)
     deadline = time.time() + wait_seconds
     poll_interval = 5
 
@@ -744,23 +747,34 @@ def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
                 ids = data[0].split() if data[0] else []
 
                 if ids:
-                    for uid in reversed(ids[-5:]):
-                        _, msg_data = mail.fetch(uid, "(RFC822)")
-                        raw = msg_data[0][1]
-                        msg = email.message_from_bytes(raw)
-
-                        # 过滤时间：只接受本次登录触发后发出的邮件
-                        # 容差 3600 秒，兼容邮件头时区偏差（如 126 邮箱 Date 字段时区少 1 小时）
-                        date_str = msg.get("Date", "")
+                    from email.utils import parsedate_to_datetime as _parse_dt
+                    # 取最近 10 封，收集所有满足时间条件的候选，最后取最新一封
+                    # 容差 3700 秒（1小时+100s）兼容 Zampto 邮件头时区比北京时间少 1 小时的问题
+                    candidates = []
+                    for uid in ids[-10:]:
                         try:
-                            from email.utils import parsedate_to_datetime
-                            mail_time = parsedate_to_datetime(date_str).timestamp()
-                            log.info(f"📧 邮件时间: {mail_time:.0f}，登录触发时间: {start_ts:.0f}，差值: {mail_time - start_ts:.0f}s")
-                            if mail_time < start_ts - 3600:
-                                log.info("⏭️ 邮件时间过早（超过容差），跳过")
+                            _, msg_data = mail.fetch(uid, "(RFC822)")
+                            raw = msg_data[0][1]
+                            msg = email.message_from_bytes(raw)
+                            date_str = msg.get("Date", "")
+                            try:
+                                mail_time = _parse_dt(date_str).timestamp()
+                            except Exception:
+                                mail_time = 0
+                            log.info(f"📧 邮件时间: {mail_time:.0f}，登录触发: {start_ts:.0f}，差值: {mail_time - start_ts:.0f}s")
+                            # 过滤：邮件时间不能比 login_click 早超过 3700 秒
+                            if mail_time < start_ts - 3700:
+                                log.info("⏭️ 过早，跳过")
                                 continue
-                        except Exception:
-                            pass
+                            candidates.append((mail_time, uid, msg))
+                        except Exception as e:
+                            log.warning(f"读取邮件异常: {e}")
+
+                    # 取时间最新的一封
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        mail_time, uid, msg = candidates[0]
+                        log.info(f"📬 选用最新邮件，时间差值: {mail_time - start_ts:.0f}s")
 
                         # 解码主题
                         subject = ""
