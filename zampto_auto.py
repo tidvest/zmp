@@ -1350,8 +1350,30 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
     return _recheck_expiry_increased(page, server_id, expiry_before)
 
 # ---------- 主流程 ----------
+def _get_or_create_fingerprint_seed() -> int:
+    """从缓存文件读取固定 seed，不存在则生成并保存。
+    缓存文件路径由 ZAMPTO_FINGERPRINT_SEED_FILE 环境变量指定，
+    默认 /tmp/zampto_fingerprint_seed.txt（Actions Cache 会缓存此文件）。
+    """
+    import random as _random
+    seed_file = os.environ.get("ZAMPTO_FINGERPRINT_SEED_FILE", "/tmp/zampto_fingerprint_seed.txt")
+    if os.path.exists(seed_file):
+        try:
+            seed = int(open(seed_file).read().strip())
+            log.info(f"🔒 使用固定指纹 seed: {seed}（来自缓存）")
+            return seed
+        except Exception:
+            pass
+    seed = _random.randint(10000, 99999)
+    os.makedirs(os.path.dirname(os.path.abspath(seed_file)), exist_ok=True)
+    open(seed_file, "w").write(str(seed))
+    log.info(f"🆕 生成新指纹 seed: {seed}（已保存到 {seed_file}）")
+    return seed
+
+
 def main():
     from cloakbrowser import launch
+    from cloakbrowser.browser import get_default_stealth_args
 
     if not SERVER_ID:
         log.error("❌ 未配置 ZAMPTO_SERVER_ID 环境变量")
@@ -1360,11 +1382,13 @@ def main():
 
     PROXY_SERVER = "socks5://127.0.0.1:1080"
 
-    # 持久化 Profile 目录（由 Actions Cache 跨 run 缓存，固定浏览器指纹）
-    import os
-    profile_dir = os.environ.get("ZAMPTO_PROFILE_DIR", "/tmp/zampto_profile")
-    os.makedirs(profile_dir, exist_ok=True)
-    log.info(f"使用 Profile 目录: {profile_dir}")
+    # 固定指纹 seed：让 Zampto 把每次 run 当成同一台设备，避免重复触发验证码
+    seed = _get_or_create_fingerprint_seed()
+    fixed_args = [
+        "--no-sandbox",
+        f"--fingerprint={seed}",
+        "--fingerprint-platform=windows",
+    ]
 
     log.info("启动 CloakBrowser...")
     browser = launch(
@@ -1372,7 +1396,8 @@ def main():
         humanize=True,
         proxy=PROXY_SERVER,
         geoip=True,
-        user_data_dir=profile_dir,
+        stealth_args=False,   # 关掉随机 seed，改用上面固定的
+        args=fixed_args,
     )
     page = browser.new_page()
 
