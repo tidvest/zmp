@@ -923,10 +923,21 @@ def login(page, max_retries=1) -> bool:
                 continue
 
             try:
+                # 用 fill() 直接写入，避免 type() 逐键模拟时丢字符
                 otp_input.click()
                 otp_input.fill("")
-                otp_input.type(otp, delay=random.randint(80, 150))
-                log.info(f"已填写验证码: {otp}")
+                time.sleep(0.3)
+                otp_input.fill(otp)
+                time.sleep(0.3)
+                # 校验实际填入内容
+                actual = otp_input.input_value()
+                if actual != otp:
+                    log.warning(f"填写验证码后内容不符（期望 {otp}，实际 {actual}），重新填入")
+                    otp_input.fill("")
+                    time.sleep(0.2)
+                    otp_input.fill(otp)
+                    actual = otp_input.input_value()
+                log.info(f"已填写验证码: {actual}")
                 human_delay()
             except Exception as e:
                 log.warning(f"填写验证码失败: {e}")
