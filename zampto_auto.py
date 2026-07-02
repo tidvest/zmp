@@ -1,4 +1,6 @@
 import os, re, logging, random, json, time
+import imaplib, email
+from email.header import decode_header
 from pathlib import Path
 from datetime import datetime
 
@@ -13,6 +15,12 @@ SERVER_ID = os.environ.get("ZAMPTO_SERVER_ID", "")
 WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
 SKIP_RENEW     = os.environ.get("SKIP_RENEW", "false").lower() == "true"
+
+# 126邮箱 IMAP（用于读取 Zampto 登录验证码）
+IMAP_HOST     = "imap.126.com"
+IMAP_PORT     = 993
+IMAP_USER     = os.environ.get("ZAMPTO_IMAP_USER", USERNAME)   # 默认和登录邮箱相同
+IMAP_PASSWORD = os.environ.get("ZAMPTO_IMAP_PASSWORD", "")     # 126邮箱授权码（非登录密码）
 
 BASE_URL    = "https://dash.zampto.net"
 AUTH_URL    = "https://dash.zampto.net/auth/login"
@@ -606,8 +614,96 @@ def try_cookie_login(page) -> bool:
     return False
 
 
+# ---------- IMAP 读取 126 邮箱验证码 ----------
+def fetch_otp_from_imap(wait_seconds=60) -> str | None:
+    """
+    等待并读取 Zampto 发来的登录验证码邮件，返回 6 位数字字符串，超时返回 None。
+    wait_seconds: 最长等待时间（秒），每 5 秒轮询一次
+    """
+    if not IMAP_PASSWORD:
+        log.warning("未配置 ZAMPTO_IMAP_PASSWORD，无法读取验证码邮件")
+        return None
+
+    log.info(f"连接 IMAP {IMAP_HOST}，等待 Zampto 验证码邮件（最多 {wait_seconds}s）...")
+    deadline = time.time() + wait_seconds
+    poll_interval = 5
+
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(IMAP_USER, IMAP_PASSWORD)
+        log.info("✅ IMAP 登录成功")
+    except Exception as e:
+        log.warning(f"IMAP 连接/登录失败: {e}")
+        return None
+
+    try:
+        while time.time() < deadline:
+            try:
+                mail.select("INBOX")
+                # 搜索发件人含 zampto 的最新未读邮件
+                _, data = mail.search(None, '(FROM "zampto" UNSEEN)')
+                ids = data[0].split() if data[0] else []
+
+                if not ids:
+                    # 也搜所有近期含验证码关键词的邮件（防止被标记已读）
+                    _, data2 = mail.search(None, 'FROM "zampto"')
+                    ids = (data2[0].split() if data2[0] else [])[-5:]  # 只看最近5封
+
+                if ids:
+                    # 从最新一封开始找
+                    for uid in reversed(ids):
+                        _, msg_data = mail.fetch(uid, "(RFC822)")
+                        raw = msg_data[0][1]
+                        msg = email.message_from_bytes(raw)
+
+                        # 解码主题
+                        subject = ""
+                        for part, enc in decode_header(msg.get("Subject", "")):
+                            if isinstance(part, bytes):
+                                subject += part.decode(enc or "utf-8", errors="ignore")
+                            else:
+                                subject += part
+
+                        # 提取正文
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    charset = part.get_content_charset() or "utf-8"
+                                    body += part.get_payload(decode=True).decode(charset, errors="ignore")
+                        else:
+                            charset = msg.get_content_charset() or "utf-8"
+                            body = msg.get_payload(decode=True).decode(charset, errors="ignore")
+
+                        log.info(f"邮件主题: {subject}")
+
+                        # 从主题或正文提取 6 位数字
+                        otp_match = re.search(r'\b(\d{6})\b', subject + " " + body)
+                        if otp_match:
+                            otp = otp_match.group(1)
+                            log.info(f"✅ 获取验证码: {otp}")
+                            # 标记为已读（避免下次重复读）
+                            mail.store(uid, '+FLAGS', '\\Seen')
+                            return otp
+            except Exception as e:
+                log.warning(f"IMAP 轮询异常: {e}")
+
+            remaining = int(deadline - time.time())
+            log.info(f"未找到验证码邮件，{poll_interval}s 后重试（剩余 {remaining}s）...")
+            time.sleep(poll_interval)
+
+        log.warning("等待验证码超时")
+        return None
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
 def login(page, max_retries=3) -> bool:
     # 新版登录页：dash.zampto.net/auth/login，邮箱+密码同页提交
+    # 点击 Login 后如果触发邮件验证码，自动通过 IMAP 读取并填入
     login_url = "https://dash.zampto.net/auth/login"
 
     for attempt in range(1, max_retries + 1):
@@ -623,7 +719,7 @@ def login(page, max_retries=3) -> bool:
                 'input#email, input[type="email"], input[placeholder*="example"]',
                 timeout=15000
             )
-        except:
+        except Exception:
             log.warning("找不到邮箱输入框，重试")
             take_screenshot(page, f"login_no_input_{attempt}")
             time.sleep(2)
@@ -663,27 +759,82 @@ def login(page, max_retries=3) -> bool:
             log.warning(f"点击 Login 按钮失败: {e}")
             continue
 
-        if wait_for_url_contains(page, "dash.zampto.net", 20):
-            # 登录后落地页是 /auth/login 表示失败，其他路径才算成功
-            if "/auth/login" not in page.url:
-                log.info("✅ 登录成功，已跳转到 dashboard")
-                take_screenshot(page, "01_login_success")
-                return True
-            else:
-                log.warning("页面仍在登录页，可能账号密码有误")
-                take_screenshot(page, f"login_fail_{attempt}")
-                time.sleep(2)
-                continue
-
+        # 等待页面响应：可能直接跳 dashboard，也可能出现验证码输入框
         time.sleep(3)
-        if "dash.zampto.net" in page.url and "/auth/login" not in page.url:
-            log.info("✅ 登录成功")
+        take_screenshot(page, f"login_after_click_{attempt}")
+
+        # 情况一：直接跳转成功
+        if "/auth/login" not in page.url:
+            log.info("✅ 登录成功（无需验证码）")
             take_screenshot(page, "01_login_success")
             return True
 
-        log.warning(f"登录后未跳转，请检查账号密码")
-        take_screenshot(page, f"login_fail_{attempt}")
-        time.sleep(2)
+        # 情况二：出现邮件验证码输入框（Zampto 2FA）
+        otp_selectors = (
+            'input[placeholder*="code" i], input[placeholder*="Code"], '
+            'input[name*="code" i], input[id*="code" i], '
+            'input[maxlength="6"], input[inputmode="numeric"]'
+        )
+        otp_input = None
+        try:
+            page.wait_for_selector(otp_selectors, timeout=8000)
+            otp_input = page.locator(otp_selectors).first
+            log.info("检测到验证码输入框，开始读取邮件验证码...")
+            take_screenshot(page, f"login_otp_page_{attempt}")
+        except Exception:
+            pass
+
+        if otp_input:
+            otp = fetch_otp_from_imap(wait_seconds=90)
+            if not otp:
+                log.warning("未能获取验证码，本次登录失败")
+                take_screenshot(page, f"login_otp_fail_{attempt}")
+                time.sleep(2)
+                continue
+
+            try:
+                otp_input.click()
+                otp_input.fill("")
+                otp_input.type(otp, delay=random.randint(80, 150))
+                log.info(f"已填写验证码: {otp}")
+                human_delay()
+            except Exception as e:
+                log.warning(f"填写验证码失败: {e}")
+                continue
+
+            # 点击验证码确认按钮
+            try:
+                verify_btn = page.locator(
+                    'button[type="submit"]:has-text("Verify"), '
+                    'button:has-text("Verify Code"), '
+                    'button:has-text("Confirm"), '
+                    'button[type="submit"]'
+                ).first
+                verify_btn.click(timeout=5000)
+                log.info("已点击验证码确认按钮")
+            except Exception as e:
+                log.warning(f"点击确认按钮失败: {e}，尝试回车")
+                try:
+                    otp_input.press("Enter")
+                except Exception:
+                    pass
+
+            # 等待跳转
+            time.sleep(5)
+            take_screenshot(page, f"login_otp_submit_{attempt}")
+
+            if "/auth/login" not in page.url:
+                log.info("✅ 验证码登录成功")
+                take_screenshot(page, "01_login_success")
+                return True
+            else:
+                log.warning("验证码提交后仍在登录页，可能验证码有误或已过期")
+                time.sleep(2)
+                continue
+        else:
+            log.warning(f"页面仍在登录页且未出现验证码框（可能账号密码有误）")
+            take_screenshot(page, f"login_fail_{attempt}")
+            time.sleep(2)
 
     return False
 
