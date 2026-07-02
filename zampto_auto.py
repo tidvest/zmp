@@ -636,6 +636,16 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
         return None
 
     try:
+        # 126/网易邮箱要求登录后先发 ID 命令，否则 SELECT 返回 NO
+        try:
+            mail._simple_command(
+                'ID',
+                '("name" "Foxmail" "version" "7.2" "vendor" "Tencent")'
+            )
+            log.info("✅ IMAP ID 命令已发送")
+        except Exception as e:
+            log.warning(f"IMAP ID 命令发送失败（可忽略）: {e}")
+
         # 必须先 SELECT 进入 SELECTED 状态，才能执行 SEARCH
         status, _ = mail.select("INBOX")
         if status != "OK":
@@ -723,7 +733,7 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
             pass
 
 
-def login(page, max_retries=2) -> bool:
+def login(page, max_retries=1) -> bool:
     # 新版登录页：dash.zampto.net/auth/login，邮箱+密码同页提交
     # 点击 Login 后如果触发邮件验证码，自动通过 IMAP 读取并填入
     login_url = "https://dash.zampto.net/auth/login"
