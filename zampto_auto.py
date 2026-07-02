@@ -749,12 +749,15 @@ def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
 
-                        # 过滤时间：只接受本次登录触发后 30 秒内的邮件
+                        # 过滤时间：只接受本次登录触发后发出的邮件
+                        # 容差 3600 秒，兼容邮件头时区偏差（如 126 邮箱 Date 字段时区少 1 小时）
                         date_str = msg.get("Date", "")
                         try:
                             from email.utils import parsedate_to_datetime
                             mail_time = parsedate_to_datetime(date_str).timestamp()
-                            if mail_time < start_ts:
+                            log.info(f"📧 邮件时间: {mail_time:.0f}，登录触发时间: {start_ts:.0f}，差值: {mail_time - start_ts:.0f}s")
+                            if mail_time < start_ts - 3600:
+                                log.info("⏭️ 邮件时间过早（超过容差），跳过")
                                 continue
                         except Exception:
                             pass
