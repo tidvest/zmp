@@ -618,7 +618,6 @@ def try_cookie_login(page) -> bool:
 def fetch_otp_from_imap(wait_seconds=60) -> str | None:
     """
     等待并读取 Zampto 发来的登录验证码邮件，返回 6 位数字字符串，超时返回 None。
-    wait_seconds: 最长等待时间（秒），每 5 秒轮询一次
     """
     if not IMAP_PASSWORD:
         log.warning("未配置 ZAMPTO_IMAP_PASSWORD，无法读取验证码邮件")
@@ -637,24 +636,40 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
         return None
 
     try:
+        # 必须先 SELECT 进入 SELECTED 状态，才能执行 SEARCH
+        status, _ = mail.select("INBOX")
+        if status != "OK":
+            log.warning(f"IMAP SELECT INBOX 失败: {status}")
+            return None
+        log.info("✅ INBOX 已选中")
+
+        # 记录开始等待的时间戳，只取之后到达的邮件，避免读旧验证码
+        start_ts = time.time()
+
         while time.time() < deadline:
             try:
+                # 每轮重新 SELECT，刷新邮件列表
                 mail.select("INBOX")
-                # 搜索发件人含 zampto 的最新未读邮件
-                _, data = mail.search(None, '(FROM "zampto" UNSEEN)')
+
+                # 搜索所有来自 zampto 的邮件（不区分已读/未读）
+                _, data = mail.search(None, 'FROM "zampto"')
                 ids = data[0].split() if data[0] else []
 
-                if not ids:
-                    # 也搜所有近期含验证码关键词的邮件（防止被标记已读）
-                    _, data2 = mail.search(None, 'FROM "zampto"')
-                    ids = (data2[0].split() if data2[0] else [])[-5:]  # 只看最近5封
-
                 if ids:
-                    # 从最新一封开始找
-                    for uid in reversed(ids):
+                    for uid in reversed(ids[-5:]):
                         _, msg_data = mail.fetch(uid, "(RFC822)")
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
+
+                        # 过滤时间：只接受本次登录触发后 30 秒内的邮件
+                        date_str = msg.get("Date", "")
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            mail_time = parsedate_to_datetime(date_str).timestamp()
+                            if mail_time < start_ts - 30:
+                                continue
+                        except Exception:
+                            pass
 
                         # 解码主题
                         subject = ""
@@ -662,31 +677,38 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
                             if isinstance(part, bytes):
                                 subject += part.decode(enc or "utf-8", errors="ignore")
                             else:
-                                subject += part
+                                subject += str(part)
 
                         # 提取正文
                         body = ""
                         if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    charset = part.get_content_charset() or "utf-8"
-                                    body += part.get_payload(decode=True).decode(charset, errors="ignore")
+                            for p in msg.walk():
+                                if p.get_content_type() == "text/plain":
+                                    charset = p.get_content_charset() or "utf-8"
+                                    body += p.get_payload(decode=True).decode(charset, errors="ignore")
                         else:
                             charset = msg.get_content_charset() or "utf-8"
                             body = msg.get_payload(decode=True).decode(charset, errors="ignore")
 
-                        log.info(f"邮件主题: {subject}")
+                        log.info(f"检查邮件主题: {subject}")
 
-                        # 从主题或正文提取 6 位数字
-                        otp_match = re.search(r'\b(\d{6})\b', subject + " " + body)
+                        # 提取 6 位纯数字验证码
+                        otp_match = re.search(r"(?<![\d])(\d{6})(?![\d])", subject + " " + body)
                         if otp_match:
                             otp = otp_match.group(1)
                             log.info(f"✅ 获取验证码: {otp}")
-                            # 标记为已读（避免下次重复读）
-                            mail.store(uid, '+FLAGS', '\\Seen')
+                            try:
+                                mail.store(uid, '+FLAGS', '\\Seen')
+                            except Exception:
+                                pass
                             return otp
+
             except Exception as e:
                 log.warning(f"IMAP 轮询异常: {e}")
+                try:
+                    mail.select("INBOX")
+                except Exception:
+                    pass
 
             remaining = int(deadline - time.time())
             log.info(f"未找到验证码邮件，{poll_interval}s 后重试（剩余 {remaining}s）...")
@@ -701,7 +723,7 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
             pass
 
 
-def login(page, max_retries=3) -> bool:
+def login(page, max_retries=2) -> bool:
     # 新版登录页：dash.zampto.net/auth/login，邮箱+密码同页提交
     # 点击 Login 后如果触发邮件验证码，自动通过 IMAP 读取并填入
     login_url = "https://dash.zampto.net/auth/login"
