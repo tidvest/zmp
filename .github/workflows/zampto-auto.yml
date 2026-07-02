@@ -27,6 +27,9 @@ jobs:
     name: 检查状态 / 自动续期
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      secrets: write   # 允许脚本回写 ZAMPTO_COOKIES Secret
 
     steps:
       - name: 检出代码
@@ -73,6 +76,8 @@ jobs:
           ZAMPTO_COOKIES:        ${{ secrets.ZAMPTO_COOKIES }}
           ZAMPTO_IMAP_USER:      ${{ secrets.ZAMPTO_IMAP_USER }}
           ZAMPTO_IMAP_PASSWORD:  ${{ secrets.ZAMPTO_IMAP_PASSWORD }}
+          GITHUB_TOKEN:          ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:     ${{ github.repository }}
           WXPUSHER_TOKEN:   ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID:     ${{ secrets.WXPUSHER_UID }}
           FORCE_RENEW:      ${{ github.event.inputs.force_renew || 'false' }}
