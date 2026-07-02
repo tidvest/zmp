@@ -1,5 +1,5 @@
 import os, re, logging, random, json, time
-import imaplib, email
+import imaplib, email, urllib.request, urllib.error, base64
 from email.header import decode_header
 from pathlib import Path
 from datetime import datetime
@@ -562,6 +562,87 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
 # ---------- 登录 ----------
 ZAMPTO_COOKIES = os.environ.get("ZAMPTO_COOKIES", "")
 
+# GitHub Actions 自动回写 Secret 所需变量（Actions 环境自动注入）
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # 格式: owner/repo
+
+
+def save_cookies_to_github_secret(page) -> bool:
+    """
+    将当前浏览器 cookies 回写到 GitHub Secret ZAMPTO_COOKIES，
+    使下次运行可以直接用 cookie 登录，跳过验证码。
+    需要 workflow 里传入 GITHUB_TOKEN 和 GITHUB_REPOSITORY。
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        log.info("非 GitHub Actions 环境，跳过 cookie 回写")
+        return False
+
+    try:
+        cookies = page.context.cookies()
+        # 只保留 zampto 相关域的 cookie，过滤广告追踪类
+        zampto_cookies = [
+            c for c in cookies
+            if "zampto" in c.get("domain", "")
+        ]
+        if not zampto_cookies:
+            log.warning("未找到 zampto 域的 cookie，跳过回写")
+            return False
+
+        cookie_json = json.dumps({"cookies": zampto_cookies})
+        log.info(f"准备回写 {len(zampto_cookies)} 条 cookie 到 GitHub Secret...")
+
+        # 第一步：获取仓库公钥（用于加密 secret）
+        owner, repo = GITHUB_REPOSITORY.split("/", 1)
+        api_base = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        req = urllib.request.Request(
+            f"{api_base}/public-key",
+            headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pubkey_data = json.loads(resp.read())
+
+        pubkey_id  = pubkey_data["key_id"]
+        pubkey_b64 = pubkey_data["key"]
+
+        # 第二步：用 PyNaCl 加密 secret 值
+        from nacl import encoding, public
+        pubkey_bytes = base64.b64decode(pubkey_b64)
+        sealed_box = public.SealedBox(public.PublicKey(pubkey_bytes))
+        encrypted = sealed_box.encrypt(cookie_json.encode("utf-8"))
+        encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+        # 第三步：PUT 更新 Secret
+        payload = json.dumps({
+            "encrypted_value": encrypted_b64,
+            "key_id": pubkey_id,
+        }).encode("utf-8")
+
+        req2 = urllib.request.Request(
+            f"{api_base}/ZAMPTO_COOKIES",
+            data=payload,
+            headers={**headers, "Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req2, timeout=15) as resp2:
+            status = resp2.status
+
+        if status in (201, 204):
+            log.info("✅ Cookie 已自动回写到 GitHub Secret ZAMPTO_COOKIES")
+            return True
+        else:
+            log.warning(f"回写 Secret 返回异常状态码: {status}")
+            return False
+
+    except Exception as e:
+        log.warning(f"回写 cookie 到 GitHub Secret 失败: {e}")
+        return False
+
 # ---------- Cookie 登录（优先方式，跳过表单+验证码） ----------
 def try_cookie_login(page) -> bool:
     if not ZAMPTO_COOKIES:
@@ -796,6 +877,7 @@ def login(page, max_retries=1) -> bool:
         if "/auth/login" not in page.url:
             log.info("✅ 登录成功（无需验证码）")
             take_screenshot(page, "01_login_success")
+            save_cookies_to_github_secret(page)
             return True
 
         # 情况二：出现邮件验证码输入框（Zampto 2FA）
@@ -855,6 +937,7 @@ def login(page, max_retries=1) -> bool:
             if "/auth/login" not in page.url:
                 log.info("✅ 验证码登录成功")
                 take_screenshot(page, "01_login_success")
+                save_cookies_to_github_secret(page)  # 登录成功后自动回写新 cookie
                 return True
             else:
                 log.warning("验证码提交后仍在登录页，可能验证码有误或已过期")
