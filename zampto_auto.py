@@ -638,10 +638,7 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
     try:
         # 126/网易邮箱要求登录后先发 ID 命令，否则 SELECT 返回 NO
         try:
-            mail._simple_command(
-                'ID',
-                '("name" "Foxmail" "version" "7.2" "vendor" "Tencent")'
-            )
+            mail.xatom('ID', '("name" "Foxmail" "version" "7.2" "vendor" "Tencent")')
             log.info("✅ IMAP ID 命令已发送")
         except Exception as e:
             log.warning(f"IMAP ID 命令发送失败（可忽略）: {e}")
