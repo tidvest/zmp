@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      actions: write
 
     steps:
       - name: 检出代码
@@ -67,6 +68,12 @@ jobs:
           echo "直连 IP：$(curl -s --max-time 5 ifconfig.me || echo '失败')"
           echo "代理 IP：$(curl -s --max-time 10 --socks5 127.0.0.1:1080 ifconfig.me || echo '代理失败，请检查 HY2_CONFIG')"
 
+      - name: 缓存浏览器指纹 seed（固定指纹，避免每次触发验证码）
+        uses: actions/cache@v4
+        with:
+          path: /tmp/zampto_fingerprint_seed.txt
+          key: zampto-fingerprint-seed-v1
+
       - name: 运行续期脚本
         env:
           ZAMPTO_USERNAME:  ${{ secrets.ZAMPTO_USERNAME }}
@@ -84,6 +91,7 @@ jobs:
           DISPLAY:          ":99"
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER:   "llvmpipe"
+          ZAMPTO_FINGERPRINT_SEED_FILE: /tmp/zampto_fingerprint_seed.txt
         run: |
           Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
           XVFB_PID=$!
