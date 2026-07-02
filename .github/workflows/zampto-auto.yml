@@ -29,7 +29,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      secrets: write   # 允许脚本回写 ZAMPTO_COOKIES Secret
 
     steps:
       - name: 检出代码
