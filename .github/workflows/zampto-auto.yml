@@ -74,16 +74,22 @@ jobs:
           path: /tmp/zampto_fingerprint_seed.txt
           key: zampto-fingerprint-seed-v1
 
+      - name: 缓存登录 Cookie（跳过验证码用）
+        uses: actions/cache@v4
+        with:
+          path: /tmp/zampto_cookies.json
+          key: zampto-cookies-${{ github.run_id }}
+          restore-keys: |
+            zampto-cookies-
+
       - name: 运行续期脚本
         env:
           ZAMPTO_USERNAME:  ${{ secrets.ZAMPTO_USERNAME }}
           ZAMPTO_PASSWORD:  ${{ secrets.ZAMPTO_PASSWORD }}
           ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
-          ZAMPTO_COOKIES:        ${{ secrets.ZAMPTO_COOKIES }}
+          ZAMPTO_COOKIE_FILE:    /tmp/zampto_cookies.json
           ZAMPTO_IMAP_USER:      ${{ secrets.ZAMPTO_IMAP_USER }}
           ZAMPTO_IMAP_PASSWORD:  ${{ secrets.ZAMPTO_IMAP_PASSWORD }}
-          GITHUB_TOKEN:          ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY:     ${{ github.repository }}
           WXPUSHER_TOKEN:   ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID:     ${{ secrets.WXPUSHER_UID }}
           FORCE_RENEW:      ${{ github.event.inputs.force_renew || 'false' }}
