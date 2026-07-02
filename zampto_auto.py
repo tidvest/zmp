@@ -696,7 +696,7 @@ def try_cookie_login(page) -> bool:
 
 
 # ---------- IMAP 读取 126 邮箱验证码 ----------
-def fetch_otp_from_imap(wait_seconds=60) -> str | None:
+def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
     """
     等待并读取 Zampto 发来的登录验证码邮件，返回 6 位数字字符串，超时返回 None。
     """
@@ -731,8 +731,8 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
             return None
         log.info("✅ INBOX 已选中")
 
-        # 记录开始等待的时间戳，只取之后到达的邮件，避免读旧验证码
-        start_ts = time.time()
+        # 只接受 Login 按钮点击之后发出的邮件，避免读到上次 run 遗留的旧验证码
+        start_ts = after_ts if after_ts else time.time()
 
         while time.time() < deadline:
             try:
@@ -754,7 +754,7 @@ def fetch_otp_from_imap(wait_seconds=60) -> str | None:
                         try:
                             from email.utils import parsedate_to_datetime
                             mail_time = parsedate_to_datetime(date_str).timestamp()
-                            if mail_time < start_ts - 30:
+                            if mail_time < start_ts:
                                 continue
                         except Exception:
                             pass
@@ -861,9 +861,11 @@ def login(page, max_retries=1) -> bool:
 
         human_delay()
 
-        # 点击 Login 按钮
+        # 点击 Login 按钮，同时记录点击时间（用于过滤旧验证码邮件）
+        login_click_ts = None
         try:
             page.locator('button[type="submit"]:has-text("Login"), button:has-text("Login")').first.click()
+            login_click_ts = time.time()
             log.info("已点击 Login 按钮")
         except Exception as e:
             log.warning(f"点击 Login 按钮失败: {e}")
@@ -896,7 +898,7 @@ def login(page, max_retries=1) -> bool:
             pass
 
         if otp_input:
-            otp = fetch_otp_from_imap(wait_seconds=90)
+            otp = fetch_otp_from_imap(wait_seconds=90, after_ts=login_click_ts)
             if not otp:
                 log.warning("未能获取验证码，本次登录失败")
                 take_screenshot(page, f"login_otp_fail_{attempt}")
@@ -1358,12 +1360,19 @@ def main():
 
     PROXY_SERVER = "socks5://127.0.0.1:1080"
 
+    # 持久化 Profile 目录（由 Actions Cache 跨 run 缓存，固定浏览器指纹）
+    import os
+    profile_dir = os.environ.get("ZAMPTO_PROFILE_DIR", "/tmp/zampto_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    log.info(f"使用 Profile 目录: {profile_dir}")
+
     log.info("启动 CloakBrowser...")
     browser = launch(
         headless=False,
         humanize=True,
         proxy=PROXY_SERVER,
         geoip=True,
+        user_data_dir=profile_dir,
     )
     page = browser.new_page()
 
