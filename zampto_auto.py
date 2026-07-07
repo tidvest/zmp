@@ -326,6 +326,9 @@ def _cf_frame_exists(page) -> bool:
 
 def turnstile_state(page, debug: bool = False) -> str:
     modal_state = page.evaluate("""() => {
+        // 兼容两种弹窗实现：旧版 #renewModal 与新版 shadcn Dialog(role=dialog, data-state=open)
+        var shadcnOpen = document.querySelector('[role="dialog"][data-state="open"]');
+        if (shadcnOpen) return 'modal_open';
         var modal = document.getElementById('renewModal');
         if (!modal) return 'no_modal';
         var cs = window.getComputedStyle(modal);
@@ -457,6 +460,8 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
     renew_modal_visible = False
     for _retry in range(6):
         renew_modal_visible = page.evaluate("""() => {
+            var shadcnOpen = document.querySelector('[role="dialog"][data-state="open"]');
+            if (shadcnOpen) return true;
             var m = document.getElementById('renewModal');
             if (!m) return false;
             var cs = window.getComputedStyle(m);
@@ -467,8 +472,9 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
         time.sleep(0.5)
 
     if not renew_modal_visible:
-        log.warning("⚠️ 续期弹窗未检测到（可能被广告弹窗遮挡或未弹出，已重试6次）")
-        return False
+        log.warning("⚠️ 续期弹窗未检测到（可能已静默通过并自动关闭，也可能被广告弹窗遮挡，已重试6次）")
+        # 弹窗可能一闪而过已经静默通过，不直接判失败，交给外层 expiry 复核兜底
+        return True
 
     start = time.time()
     deadline = start + timeout
@@ -651,6 +657,15 @@ def try_cookie_login(page) -> bool:
 
 
 # ---------- IMAP 读取 126 邮箱验证码 ----------
+def _mask_code(code: str) -> str:
+    """日志中隐藏验证码，只保留首尾各1位，例如 093051 -> 0****1"""
+    if not code:
+        return ""
+    if len(code) <= 2:
+        return "*" * len(code)
+    return code[0] + "*" * (len(code) - 2) + code[-1]
+
+
 def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
     """
     等待并读取 Zampto 发来的登录验证码邮件，返回 6 位数字字符串，超时返回 None。
@@ -756,7 +771,7 @@ def fetch_otp_from_imap(wait_seconds=60, after_ts=None) -> str | None:
                         otp_match = re.search(r"(?<![\d])(\d{6})(?![\d])", subject + " " + body)
                         if otp_match:
                             otp = otp_match.group(1)
-                            log.info(f"✅ 获取验证码: {otp}")
+                            log.info(f"✅ 获取验证码: {_mask_code(otp)}")
                             try:
                                 mail.store(uid, '+FLAGS', '\\Seen')
                             except Exception:
@@ -887,12 +902,12 @@ def login(page, max_retries=1) -> bool:
                 # 校验实际填入内容
                 actual = otp_input.input_value()
                 if actual != otp:
-                    log.warning(f"填写验证码后内容不符（期望 {otp}，实际 {actual}），重新填入")
+                    log.warning(f"填写验证码后内容不符（期望 {_mask_code(otp)}，实际 {_mask_code(actual)}），重新填入")
                     otp_input.fill("")
                     time.sleep(0.2)
                     otp_input.fill(otp)
                     actual = otp_input.input_value()
-                log.info(f"已填写验证码: {actual}")
+                log.info(f"已填写验证码: {_mask_code(actual)}")
                 human_delay()
             except Exception as e:
                 log.warning(f"填写验证码失败: {e}")
@@ -1289,46 +1304,31 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
 
     take_screenshot(page, "06_renew_modal")
 
-    # ── Zampto 使用无感 Turnstile：弹窗出现 → 静默验证（<3s）→ 续期成功 → 页面自动重载
-    # 不检测 Turnstile widget，直接监听"页面重载"信号（context destroyed = 导航发生）
-    log.info("等待续期弹窗自动完成（监听页面重载信号，最多 40s）...")
+    # ── Zampto 的 Turnstile 大多数情况下无感静默通过，但偶尔（如本次）会出现
+    # 需要真人点击的可见勾选框（"Bestätigen Sie, dass Sie ein Mensch sind"）。
+    # 因此不能只被动等待弹窗消失/页面重载，必须用 wait_cf_turnstile 主动检测状态，
+    # 并在检测到勾选框未通过时用真实鼠标事件（page.mouse.move + click）去点击它。
+    log.info("处理续期验证码（Zampto Turnstile）...")
     nav_detected = False
-    modal_gone   = False
-    for _tick in range(40):
-        try:
-            ready = page.evaluate("() => document.readyState")
-            # 页面还在，检查弹窗是否已消失（续期成功后弹窗关闭）
-            modal_open = page.evaluate("""() => {
-                // shadcn Dialog: role=dialog + data-state=open
-                var d = document.querySelector('[role=\"dialog\"][data-state=\"open\"]');
-                if (d) return true;
-                // 兜底：页面文本含 Renew Server 弹窗关键词
-                var body = document.body.innerText || '';
-                return body.includes('Loading security verification') ||
-                       body.includes('Processing renewal request') ||
-                       body.includes('complete the security verification');
-            }""")
-            if not modal_open:
-                modal_gone = True
-                log.info(f"✅ 续期弹窗已消失（第 {_tick+1}s），续期流程完成")
-                break
-        except Exception as e:
-            err = str(e).lower()
-            if any(k in err for k in ("context", "destroyed", "navigation", "detached")):
-                nav_detected = True
-                log.info(f"✅ 检测到页面自动重载（Turnstile 静默通过后自动续期完成）: {e}")
-            else:
-                log.warning(f"evaluate 异常: {e}")
-            break
-        time.sleep(1)
-    else:
-        log.warning("⚠️ 40s 内未检测到弹窗消失或页面重载，进行 expiry 复核...")
+    try:
+        turnstile_ok = wait_cf_turnstile(page, timeout=40)
+    except Exception as e:
+        err = str(e).lower()
+        if any(k in err for k in ("context", "destroyed", "navigation", "detached")):
+            nav_detected = True
+            turnstile_ok = True
+            log.info(f"✅ 检测到页面自动重载（Turnstile 通过后自动续期完成）: {e}")
+        else:
+            log.warning(f"wait_cf_turnstile 异常: {e}")
+            turnstile_ok = False
 
     take_screenshot(page, "07_after_renew")
 
-    if nav_detected or modal_gone:
-        # 页面导航后先等它加载完
+    if turnstile_ok or nav_detected:
+        # 页面可能刚发生导航，先等它加载完，再进入 expiry 复核
         time.sleep(3)
+    else:
+        log.warning("⚠️ Turnstile 验证未确认通过，进行 expiry 复核兜底判断...")
 
     return _recheck_expiry_increased(page, server_id, expiry_before)
 
