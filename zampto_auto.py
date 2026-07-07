@@ -325,52 +325,67 @@ def _cf_frame_exists(page) -> bool:
 
 
 def turnstile_state(page, debug: bool = False) -> str:
+    # 以 challenges.cloudflare.com iframe 是否存在为主要依据，
+    # 比 DOM 弹窗结构更可靠（不受弹窗实现方式影响）
+    cf_iframe_exists = any(
+        "challenges.cloudflare.com" in (f.url or "") for f in page.frames
+    )
+    if cf_iframe_exists:
+        if not _cf_frame_seen_ts["seen"]:
+            _cf_frame_seen_ts["seen"] = True
+        # iframe 存在时检查 token 是否已填入（即已通过）
+        token_ready = page.evaluate("""() => {
+            function deepQuery(root, sel) {
+                let el = root.querySelector(sel);
+                if (el) return el;
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) {
+                        el = deepQuery(host.shadowRoot, sel);
+                        if (el) return el;
+                    }
+                }
+                return null;
+            }
+            var tokenEl = deepQuery(document, 'input[name="cf-turnstile-response"]');
+            return !!(tokenEl && (tokenEl.value || '').length > 10);
+        }""")
+        if token_ready:
+            if debug:
+                log.info("[诊断/turnstile_state] cf_iframe_exists=True, token_ready=True → done")
+            return 'done'
+        if debug:
+            log.info("[诊断/turnstile_state] cf_iframe_exists=True, token_ready=False → unchecked")
+        return 'unchecked'
+
+    # iframe 不存在，检查弹窗 DOM 是否还在
     modal_state = page.evaluate("""() => {
-        // 兼容两种弹窗实现：旧版 #renewModal 与新版 shadcn Dialog(role=dialog, data-state=open)
-        var shadcnOpen = document.querySelector('[role="dialog"][data-state="open"]');
-        if (shadcnOpen) return 'modal_open';
-        var modal = document.getElementById('renewModal');
-        if (!modal) return 'no_modal';
-        var cs = window.getComputedStyle(modal);
-        if (cs.display === 'none' || cs.visibility === 'hidden') return 'modal_hidden';
-        return 'modal_open';
+        if (document.querySelector('[role="dialog"][data-state="open"]')) return 'modal_open';
+        var allDialogs = document.querySelectorAll(
+            '[role="dialog"], .modal, [class*="modal"], [class*="dialog"], [class*="Dialog"]'
+        );
+        for (var d of allDialogs) {
+            var cs = window.getComputedStyle(d);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+            var txt = d.innerText || '';
+            if (txt.includes('security verification') || txt.includes('Mensch') ||
+                txt.includes('Renew Server') || txt.includes('complete the')) return 'modal_open';
+        }
+        var m = document.getElementById('renewModal');
+        if (m) {
+            var cs = window.getComputedStyle(m);
+            if (cs.display !== 'none' && cs.visibility !== 'hidden') return 'modal_open';
+        }
+        return 'no_modal';
     }""")
 
     if modal_state != 'modal_open':
         if debug:
-            log.info(f"[诊断/turnstile_state] modal_state={modal_state} → done")
+            log.info(f"[诊断/turnstile_state] no cf_iframe, modal_state={modal_state} → done")
         return 'done'
 
-    token_ready = page.evaluate("""() => {
-        function deepQuery(root, sel) {
-            let el = root.querySelector(sel);
-            if (el) return el;
-            for (const host of root.querySelectorAll('*')) {
-                if (host.shadowRoot) {
-                    el = deepQuery(host.shadowRoot, sel);
-                    if (el) return el;
-                }
-            }
-            return null;
-        }
-        var tokenEl = deepQuery(document, 'input[name="cf-turnstile-response"]');
-        return !!(tokenEl && (tokenEl.value || '').length > 10);
-    }""")
-    if token_ready:
-        if debug:
-            log.info("[诊断/turnstile_state] token_ready=True → done")
-        return 'done'
-
+    # 弹窗还在但 iframe 不在 → 可能 iframe 还没加载 / 曾经有过已消失
     if _cf_frame_seen_ts["first_check_ts"] is None:
         _cf_frame_seen_ts["first_check_ts"] = time.time()
-
-    frame_exists_now = _cf_frame_exists(page)
-    if debug:
-        log.info(f"[诊断/turnstile_state] modal_open=True, token_ready=False, "
-                  f"frame_exists_now={frame_exists_now}, seen_before={_cf_frame_seen_ts['seen']}")
-
-    if frame_exists_now:
-        return 'unchecked'
 
     if _cf_frame_seen_ts["seen"]:
         if debug:
@@ -379,11 +394,14 @@ def turnstile_state(page, debug: bool = False) -> str:
 
     elapsed = time.time() - _cf_frame_seen_ts["first_check_ts"]
     if elapsed < 2.5:
+        if debug:
+            log.info(f"[诊断/turnstile_state] 等待 iframe 加载，elapsed={elapsed:.1f}s → verifying")
         return 'verifying'
 
+    # 超过宽限期仍无 iframe，但弹窗还开着 → 强制当 unchecked 处理，触发点击
     if debug:
-        log.info(f"[诊断/turnstile_state] 宽限期已过({elapsed:.1f}s)仍未见过 frame → done")
-    return 'done'
+        log.info(f"[诊断/turnstile_state] 宽限期已过({elapsed:.1f}s)仍未见 iframe，弹窗仍存在 → unchecked（强制点击）")
+    return 'unchecked'
 
 
 def click_turnstile_checkbox(page, timeout=10) -> bool:
@@ -455,24 +473,54 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
     log.info("等待 Cloudflare Turnstile 验证...")
     _reset_cf_frame_seen()
 
-    # 单次 evaluate 容易撞上页面局部重渲染（倒计时/状态刷新）的瞬时空档，
-    # 导致弹窗明明存在却查不到 → 改为短轮询，最多查 6 次（约 3s）
-    renew_modal_visible = False
-    for _retry in range(6):
-        renew_modal_visible = page.evaluate("""() => {
-            var shadcnOpen = document.querySelector('[role="dialog"][data-state="open"]');
-            if (shadcnOpen) return true;
-            var m = document.getElementById('renewModal');
-            if (!m) return false;
-            var cs = window.getComputedStyle(m);
-            return cs.display !== 'none' && cs.visibility !== 'hidden';
-        }""")
-        if renew_modal_visible:
+    # ── 弹窗/Turnstile 存在性检测 ─────────────────────────────────
+    # 优先检测 challenges.cloudflare.com iframe（比DOM弹窗结构更可靠，
+    # 无论弹窗是 shadcn Dialog/Bootstrap Modal/#renewModal/自定义 div 都能识别）
+    # 同时兼顾 DOM 层面的弹窗结构作为辅助。
+    # 最多等待 8s，给弹窗和 Turnstile iframe 足够的挂载时间。
+    turnstile_or_modal_visible = False
+    for _retry in range(16):  # 16 × 0.5s = 8s
+        # 优先：直接检查 Turnstile iframe 是否已注入
+        cf_iframe_exists = any(
+            "challenges.cloudflare.com" in (f.url or "") for f in page.frames
+        )
+        if cf_iframe_exists:
+            log.info("【Turnstile】检测到 challenges.cloudflare.com iframe，进入处理流程")
+            turnstile_or_modal_visible = True
             break
+
+        # 辅助：DOM 弹窗结构（兜底，以防 iframe 注入慢）
+        dom_visible = page.evaluate("""() => {
+            // shadcn Dialog
+            if (document.querySelector('[role="dialog"][data-state="open"]')) return true;
+            // 任意包含 Turnstile 文字的可见弹窗
+            var allDialogs = document.querySelectorAll(
+                '[role="dialog"], .modal, [class*="modal"], [class*="dialog"], [class*="Dialog"]'
+            );
+            for (var d of allDialogs) {
+                var cs = window.getComputedStyle(d);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+                var txt = d.innerText || '';
+                if (txt.includes('security verification') || txt.includes('Mensch') ||
+                    txt.includes('Renew Server') || txt.includes('complete the')) return true;
+            }
+            // 旧版 #renewModal
+            var m = document.getElementById('renewModal');
+            if (m) {
+                var cs = window.getComputedStyle(m);
+                if (cs.display !== 'none' && cs.visibility !== 'hidden') return true;
+            }
+            return false;
+        }""")
+        if dom_visible:
+            log.info(f"【Turnstile】检测到续期弹窗（DOM 结构，第 {_retry+1} 次）")
+            turnstile_or_modal_visible = True
+            break
+
         time.sleep(0.5)
 
-    if not renew_modal_visible:
-        log.warning("⚠️ 续期弹窗未检测到（可能已静默通过并自动关闭，也可能被广告弹窗遮挡，已重试6次）")
+    if not turnstile_or_modal_visible:
+        log.warning("⚠️ 8s 内未检测到 Turnstile iframe 或续期弹窗（可能已静默通过并自动关闭）")
         # 弹窗可能一闪而过已经静默通过，不直接判失败，交给外层 expiry 复核兜底
         return True
 
