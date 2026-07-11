@@ -243,11 +243,34 @@ def dismiss_all_popups(page):
             );
             if (ariaClose && ariaClose.offsetParent !== null) { ariaClose.click(); count++; }
 
-            // ③ GDPR：Nicht einwilligen / Decline / Reject / Do not consent
-            var gdprTexts = ['Nicht einwilligen', 'Decline', 'Reject', 'Do not consent'];
+            // ③ GDPR：Nicht einwilligen / Decline / Reject / Do not consent / Refuser (fr) / etc.
+            var gdprTexts = [
+                'Nicht einwilligen', 'Decline', 'Reject', 'Do not consent',
+                'Refuser', 'Tout refuser', 'Refuser tout', 'Je refuse',   // French
+                'Rechazar', 'Rechazar todo',                               // Spanish
+                'Rifiuta', 'Rifiuta tutto',                                // Italian
+                'Weigeren', 'Alles weigeren',                              // Dutch
+                'Odrzuć', 'Odrzuć wszystko',                               // Polish
+            ];
             for (var gt of gdprTexts) {
-                var gb = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === gt);
+                var gb = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim().toLowerCase() === gt.toLowerCase());
                 if (gb && gb.offsetParent !== null) { gb.click(); count++; break; }
+            }
+
+            // ③-b CMP 兜底：Axeptio / Didomi / OneTrust / Cookiebot 等第三方同意框
+            //   优先点"拒绝"按钮，找不到就点"关闭"
+            var cmpRejectSelectors = [
+                '[id*="reject"], [id*="decline"], [id*="refuse"]',
+                '[class*="reject"], [class*="decline"], [class*="refuse"]',
+                'button[data-testid*="reject"], button[data-testid*="decline"]',
+                '#didomi-notice-disagree-button',     // Didomi
+                '#onetrust-reject-all-handler',       // OneTrust
+                '.cc-deny', '.cm-btn-deny',           // Cookie Consent / CookieMonster
+                '[aria-label*="efus"], [aria-label*="eclin"], [aria-label*="eject"]',
+            ];
+            for (var sel of cmpRejectSelectors) {
+                var btn = document.querySelector(sel);
+                if (btn && btn.offsetParent !== null) { btn.click(); count++; break; }
             }
 
             // ④ Zampto continue-prompt / close-button-protector
